@@ -57,6 +57,7 @@ use crate::parser::CodeBlockKind;
 /// If the callback returns `None`, the default link style will be used.
 type LinkStyleCallback = Rc<dyn Fn(&str, &App) -> Option<TextStyleRefinement>>;
 pub type CodeSpanLinkCallback = Arc<dyn Fn(&str, &App) -> Option<SharedString> + 'static>;
+type UrlHoverCallback = Rc<dyn Fn(Option<SharedString>, &mut Window, &mut App)>;
 type SourceClickCallback = Box<dyn Fn(usize, usize, &mut Window, &mut App) -> bool>;
 type CheckboxToggleCallback = Rc<dyn Fn(Range<usize>, bool, &mut Window, &mut App)>;
 
@@ -1246,6 +1247,7 @@ pub struct MarkdownElement {
     style: MarkdownStyle,
     code_block_renderer: CodeBlockRenderer,
     on_url_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App)>>,
+    on_url_hover: Option<UrlHoverCallback>,
     code_span_link: Option<CodeSpanLinkCallback>,
     on_source_click: Option<SourceClickCallback>,
     on_checkbox_toggle: Option<CheckboxToggleCallback>,
@@ -1265,6 +1267,7 @@ impl MarkdownElement {
                 border: false,
             },
             on_url_click: None,
+            on_url_hover: None,
             code_span_link: None,
             on_source_click: None,
             on_checkbox_toggle: None,
@@ -1305,6 +1308,14 @@ impl MarkdownElement {
         handler: impl Fn(SharedString, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_url_click = Some(Rc::new(handler));
+        self
+    }
+
+    pub fn on_url_hover(
+        mut self,
+        handler: impl Fn(Option<SharedString>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_url_hover = Some(Rc::new(handler));
         self
     }
 
@@ -1808,6 +1819,7 @@ impl MarkdownElement {
         }
 
         let on_open_url = self.on_url_click.take();
+        let on_url_hover = self.on_url_hover.take();
         let on_source_click = self.on_source_click.take();
 
         self.on_mouse_event(window, cx, {
@@ -1936,16 +1948,22 @@ impl MarkdownElement {
                     markdown.autoscroll_request = Some(source_index);
                     cx.notify();
                 } else {
-                    let is_hovering_clickable = hitbox.is_hovered(window)
-                        && rendered_text
-                            .source_index_for_position(event.position)
-                            .ok()
-                            .is_some_and(|source_index| {
-                                rendered_text.link_for_source_index(source_index).is_some()
-                                    || rendered_text
-                                        .footnote_ref_for_source_index(source_index)
-                                        .is_some()
-                            });
+                    let source_index = hitbox
+                        .is_hovered(window)
+                        .then(|| rendered_text.source_index_for_position(event.position).ok())
+                        .flatten();
+                    let hovered_url = source_index
+                        .and_then(|source_index| rendered_text.link_for_source_index(source_index))
+                        .map(|link| link.destination_url.clone());
+                    let is_hovering_clickable = hovered_url.is_some()
+                        || source_index.is_some_and(|source_index| {
+                            rendered_text
+                                .footnote_ref_for_source_index(source_index)
+                                .is_some()
+                        });
+                    if let Some(on_url_hover) = on_url_hover.as_ref() {
+                        on_url_hover(hovered_url, window, cx);
+                    }
                     if is_hovering_clickable != was_hovering_clickable {
                         cx.notify();
                     }
@@ -4078,6 +4096,7 @@ mod tests {
     use super::*;
     use gpui::{RenderImage, TestAppContext, UpdateGlobal, size};
     use language::{Language, LanguageConfig, LanguageMatcher};
+    use std::{cell::RefCell, rc::Rc};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -5287,6 +5306,56 @@ mod tests {
         cx.update(|_window, cx| {
             assert!(markdown.read(cx).context_menu_link().is_none());
         });
+    }
+
+    #[gpui::test]
+    fn test_url_hover_callback(cx: &mut TestAppContext) {
+        struct HoverTestView {
+            markdown: Entity<Markdown>,
+            hovered_urls: Rc<RefCell<Vec<Option<SharedString>>>>,
+        }
+
+        impl Render for HoverTestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let hovered_urls = self.hovered_urls.clone();
+                div().size_full().child(
+                    MarkdownElement::new(self.markdown.clone(), MarkdownStyle::default())
+                        .on_url_hover(move |url, _, _| {
+                            hovered_urls.borrow_mut().push(url);
+                        }),
+                )
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let hovered_urls = Rc::new(RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view({
+            let hovered_urls = hovered_urls.clone();
+            move |_, cx| HoverTestView {
+                markdown: cx.new(|cx| {
+                    Markdown::new("[link](https://example.com)".into(), None, None, cx)
+                }),
+                hovered_urls,
+            }
+        });
+        cx.run_until_parked();
+
+        cx.simulate_mouse_move(
+            point(px(8.), px(8.)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            hovered_urls.borrow().last().cloned().flatten().as_deref(),
+            Some("https://example.com")
+        );
+
+        cx.simulate_mouse_move(
+            point(px(500.), px(500.)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(hovered_urls.borrow().last(), Some(&None));
     }
 
     #[gpui::test]
